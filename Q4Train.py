@@ -1,13 +1,14 @@
-"""
-Q4Train.py: Training script for the best performing VGG6 configuration on CIFAR-10.
-Achieved Best Validation Accuracy: 87.10% | Test Accuracy: 86.90%
-Configuration: ReLU activation, Nadam optimizer, Batch Normalization enabled,
-               Batch Size: 128, Epochs: 120, Learning Rate: 0.001, Seed: 19.
-"""
 
+import os
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+
+import json
+import random
 from pathlib import Path
-import torch
+
+import numpy as np
 import pandas as pd
+import torch
 
 from DataManager.DatasetNormalizer import DatasetNormalizer
 from Models.NeuralNet import NeuralNet
@@ -15,8 +16,38 @@ from Models.Optimizers import OptimizerFactory
 from Models.Trainer import Trainer
 
 
-def main():
+def set_seed(seed: int) -> None:
+    """Seed Python, NumPy, PyTorch CPU and CUDA random-number generators."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    # Prefer deterministic kernels and disable autotuning.
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # Some operations may not have deterministic implementations on every
+    # installed backend. warn_only=True reports these without aborting training.
+    try:
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    except TypeError:
+        # Compatibility with older PyTorch releases.
+        torch.use_deterministic_algorithms(True)
+
+    # Avoid TF32 differences on supported NVIDIA GPUs.
+    if hasattr(torch.backends, "cuda") and hasattr(torch.backends.cuda, "matmul"):
+        torch.backends.cuda.matmul.allow_tf32 = False
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.allow_tf32 = False
+
+
+def main() -> None:
     config_dict = {
+        # Run 22: selected best-validation configuration
         "activation": "relu",
         "optimizer": "nadam",
         "batch_size": 128,
@@ -26,13 +57,18 @@ def main():
         "weight_decay": 0.0001,
         "use_batchnorm": True,
         "seed": 19,
+
+        # Runtime and paths
         "num_workers": 2,
-        "device": "auto",
+        "device": "auto",  # auto, cpu, or cuda
         "data_dir": "./CIFAR10Dataset",
-        "output_dir": "./outputs/Q4_BestModel",
+        # Keep this aligned with Q4Eval.py and the README.
+        "output_dir": "./BestModel",
+
+        # Preprocessing: use the cached/calculated CIFAR-10 channel statistics.
         "calc_meanstd": True,
-        "normalize_mean": (0.5, 0.5, 0.5),
-        "normalize_std": (0.5, 0.5, 0.5),
+        "normalize_mean": (0.5, 0.5, 0.5),  # ignored when calc_meanstd=True
+        "normalize_std": (0.5, 0.5, 0.5),   # ignored when calc_meanstd=True
         "add_crop": True,
         "crop_padding": 4,
         "horizontal_flip_prob": 0.5,
@@ -46,21 +82,34 @@ def main():
         "random_erasing_scale": (0.02, 0.10),
         "random_erasing_ratio": (0.5, 2.0),
         "no_download": False,
-        "evaluate_test": True,
     }
+
+    # Seed before constructing the dataset, model, optimizer, or data loaders.
+    set_seed(config_dict["seed"])
+
+    if config_dict["device"] == "cpu":
+        device = torch.device("cpu")
+    elif config_dict["device"] == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("device='cuda' was requested, but CUDA is unavailable.")
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     output_dir = Path(config_dict["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Set random seed for complete reproducibility
-    torch.manual_seed(config_dict["seed"])
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(config_dict["seed"])
+    print("=" * 72)
+    print("Q4 – Final CIFAR-10 Model Training")
+    print(f"Seed: {config_dict['seed']}")
+    print(f"Device: {device}")
+    print(f"Output directory: {output_dir.resolve()}")
+    print("Deterministic algorithms: enabled (warn_only=True)")
+    print("=" * 72)
 
-    device = torch.device("cuda" if torch.cuda.is_available() and config_dict["device"] != "cpu" else "cpu")
-    print(f"Using device: {device}")
-
-    # Build reproducible data loaders using DatasetNormalizer class
+    # DatasetNormalizer uses the supplied seed for the 45k/5k split and the
+    # training DataLoader shuffle generator. Validation/test transforms should
+    # remain deterministic and must not include training augmentation.
     data_module = DatasetNormalizer(
         data_dir=config_dict["data_dir"],
         batch_size=config_dict["batch_size"],
@@ -78,13 +127,15 @@ def main():
     )
     train_loader, val_loader, test_loader = data_module.build_loaders()
 
-    # Initialize Neural Net Model with Batch Normalization
+    # Re-seed immediately before model creation so model initialization starts
+    # from the same RNG state even if dataset/statistics setup used randomness.
+    set_seed(config_dict["seed"])
+
     model = NeuralNet(
         activation=config_dict["activation"],
         use_batchnorm=config_dict["use_batchnorm"],
     ).to(device)
 
-    # Create Optimizer via OptimizerFactory
     optimizer = OptimizerFactory.create(
         name=config_dict["optimizer"],
         model_parameters=model.parameters(),
@@ -93,25 +144,60 @@ def main():
         weight_decay=config_dict["weight_decay"],
     )
 
-    # Initialize Trainer without logger
     trainer = Trainer(model, optimizer, device, output_dir, logger=None)
 
-    print("\nStarting training with the optimal configuration...")
-    history = trainer.train(train_loader, val_loader, config_dict["epochs"], config_dict)
+    print("\nStarting training with the selected Run 22 configuration...\n")
+    history = trainer.train(
+        train_loader,
+        val_loader,
+        config_dict["epochs"],
+        config_dict,
+    )
 
-    # Save epoch-wise history to CSV
-    pd.DataFrame(history).to_csv(output_dir / "history.csv", index=False)
+    history_path = output_dir / "history.csv"
+    pd.DataFrame(history).to_csv(history_path, index=False)
 
-    # Evaluate on Held-out Test Set
-    print("\nEvaluating best model checkpoint on test set...")
+    # Trainer.evaluate_test() restores the checkpoint with the highest
+    # validation accuracy before computing held-out test metrics.
+    print("\nEvaluating the best-validation checkpoint on the held-out test set...")
     test_metrics = trainer.evaluate_test(test_loader)
 
-    print("=" * 60)
-    print("Training Complete Successfully!")
-    print(f"Best Validation Accuracy: {trainer.best_validation_accuracy * 100:.2f}%")
-    print(f"Test Loss: {test_metrics['test/loss']:.4f}")
-    print(f"Test Accuracy: {test_metrics['test/accuracy'] * 100:.2f}%")
-    print("=" * 60)
+    best_checkpoint_path = output_dir / "best_model.pt"
+    checkpoint = torch.load(
+        best_checkpoint_path,
+        map_location="cpu",
+        weights_only=True,
+    )
+    best_epoch = int(checkpoint.get("epoch", -1))
+    best_val_accuracy = float(checkpoint["best_validation_accuracy"])
+
+    results = {
+        "configuration": {
+            key: list(value) if isinstance(value, tuple) else value
+            for key, value in config_dict.items()
+        },
+        "best_epoch": best_epoch,
+        "best_validation_accuracy": best_val_accuracy,
+        "test_loss": float(test_metrics["test/loss"]),
+        "test_accuracy": float(test_metrics["test/accuracy"]),
+        "checkpoint": str(best_checkpoint_path),
+        "history_csv": str(history_path),
+    }
+
+    result_path = output_dir / "result.json"
+    with result_path.open("w", encoding="utf-8") as file:
+        json.dump(results, file, indent=4)
+
+    print("\n" + "=" * 72)
+    print("Training completed.")
+    print(f"Best validation epoch : {best_epoch}")
+    print(f"Best validation acc.  : {best_val_accuracy * 100:.2f}%")
+    print(f"Test loss             : {test_metrics['test/loss']:.4f}")
+    print(f"Test accuracy         : {test_metrics['test/accuracy'] * 100:.2f}%")
+    print(f"Checkpoint            : {best_checkpoint_path}")
+    print(f"History               : {history_path}")
+    print(f"Results               : {result_path}")
+    print("=" * 72)
 
 
 if __name__ == "__main__":
