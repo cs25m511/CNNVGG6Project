@@ -1,11 +1,6 @@
 # VGG6 on CIFAR-10: Systems Engineering for Deep Learning – Assignment 1
 
 **Student Name:** Jitender Kumar (CS25M511)
-
-**Email:** cs25m511@smail.iitm.ac.in
-
-**Program:** Web-M.Tech Programme, IIT Madras
-
 **Course:** CS6886W – Systems Engineering for Deep Learning
 
 ---
